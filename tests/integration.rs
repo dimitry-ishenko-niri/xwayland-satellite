@@ -1,4 +1,4 @@
-use rustix::event::{poll, PollFd, PollFlags};
+use rustix::event::{PollFd, PollFlags, poll};
 use rustix::process::{Pid, Signal, WaitOptions};
 use std::collections::HashMap;
 use std::io::Write;
@@ -6,17 +6,17 @@ use std::mem::ManuallyDrop;
 use std::os::fd::{AsRawFd, BorrowedFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
     Arc, Mutex, Once,
+    atomic::{AtomicBool, Ordering},
 };
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 use wayland_protocols::xdg::{
     decoration::zv1::server::zxdg_toplevel_decoration_v1, shell::server::xdg_toplevel,
 };
-use wayland_server::protocol::{wl_output, wl_pointer};
 use wayland_server::Resource;
-use xcb::{x, Xid};
+use wayland_server::protocol::{wl_output, wl_pointer};
+use xcb::{Xid, x};
 use xwayland_satellite as xwls;
 use xwayland_satellite::xstate::{MoveResizeDirection, WmSizeHintsFlags, WmState};
 use xwls::timespec_from_millis;
@@ -319,7 +319,7 @@ impl Fixture {
     fn create_output(&mut self, x: i32, y: i32) -> wayland_server::protocol::wl_output::WlOutput {
         self.testwl.new_output(x, y);
         self.wait_and_dispatch();
-        self.testwl.last_created_output()
+        self.testwl.finalize_output()
     }
 }
 
@@ -345,7 +345,9 @@ xcb::atoms_struct! {
         win_type_tooltip => b"_NET_WM_WINDOW_TYPE_TOOLTIP",
         win_type_utility => b"_NET_WM_WINDOW_TYPE_UTILITY",
         win_type_dnd => b"_NET_WM_WINDOW_TYPE_DND",
+        win_type_combo => b"_NET_WM_WINDOW_TYPE_COMBO",
         motif_wm_hints => b"_MOTIF_WM_HINTS" only_if_exists = false,
+        wm_hints => b"WM_HINTS",
         mime1 => b"text/plain" only_if_exists = false,
         mime2 => b"blah/blah" only_if_exists = false,
         incr => b"INCR",
@@ -456,6 +458,12 @@ impl Connection {
     #[track_caller]
     fn map_window(&self, window: x::Window) {
         self.send_and_check_request(&x::MapWindow { window })
+            .unwrap();
+    }
+
+    #[track_caller]
+    fn unmap_window(&self, window: x::Window) {
+        self.send_and_check_request(&x::UnmapWindow { window })
             .unwrap();
     }
 
@@ -707,6 +715,16 @@ fn toplevel_flow() {
     connection.map_window(window);
     f.wait_and_dispatch();
 
+    let reply = connection.get_reply(&x::GetProperty {
+        delete: false,
+        window,
+        property: connection.atoms.wm_state,
+        r#type: connection.atoms.wm_state,
+        long_offset: 0,
+        long_length: 1,
+    });
+    assert_eq!(reply.value::<u32>(), &[WmState::Normal as u32]);
+
     let surface = f
         .testwl
         .last_created_surface_id()
@@ -757,6 +775,27 @@ fn toplevel_flow() {
         data.toplevel().max_size,
         Some(testwl::Vec2 { x: 150, y: 200 })
     );
+
+    connection.unmap_window(window);
+    f.wait_and_dispatch();
+
+    let reply = connection.get_reply(&x::GetProperty {
+        delete: false,
+        window,
+        property: connection.atoms.wm_state,
+        r#type: connection.atoms.wm_state,
+        long_offset: 0,
+        long_length: 1,
+    });
+    assert_eq!(reply.value::<u32>(), &[WmState::Withdrawn as u32]);
+
+    connection.map_window(window);
+    f.wait_and_dispatch();
+    let surface = f
+        .testwl
+        .last_created_surface_id()
+        .expect("No surface created!");
+    f.configure_and_verify_new_toplevel(&mut connection, window, surface);
 
     f.wm_delete_window(&mut connection, window, surface);
 
@@ -2011,7 +2050,151 @@ fn popup_heuristics() {
         connection.atoms.win_type,
         &[connection.atoms.win_type_utility],
     );
+    connection.set_property(
+        wechat_popup,
+        connection.atoms.motif_wm_hints,
+        connection.atoms.motif_wm_hints,
+        &[0x2_u32, 0, 0, 0, 0],
+    );
     f.map_as_popup(&mut connection, wechat_popup);
+
+    let fcitx5_popup = connection.new_window(connection.root, 10, 10, 50, 50, true);
+    connection.set_property(
+        fcitx5_popup,
+        x::ATOM_ATOM,
+        connection.atoms.win_type,
+        &[connection.atoms.win_type_combo],
+    );
+    f.map_as_popup(&mut connection, fcitx5_popup);
+
+    let godot_popup = connection.new_window(connection.root, 10, 10, 50, 50, true);
+    connection.set_property(
+        godot_popup,
+        x::ATOM_ATOM,
+        connection.atoms.win_type,
+        &[connection.atoms.win_type_utility],
+    );
+    connection.set_property(
+        godot_popup,
+        connection.atoms.motif_wm_hints,
+        connection.atoms.motif_wm_hints,
+        &[0x2_u32, 0, 0, 0, 0],
+    );
+    f.map_as_popup(&mut connection, godot_popup);
+
+    let material_maker_popup = connection.new_window(connection.root, 10, 10, 50, 50, false);
+    connection.set_property(
+        material_maker_popup,
+        x::ATOM_ATOM,
+        connection.atoms.win_type,
+        &[connection.atoms.win_type_utility],
+    );
+    connection.set_property(
+        material_maker_popup,
+        connection.atoms.motif_wm_hints,
+        connection.atoms.motif_wm_hints,
+        &[0x2_u32, 0, 0, 0, 0],
+    );
+    f.map_as_popup(&mut connection, material_maker_popup);
+
+    let ardour_toplevel = connection.new_window(connection.root, 10, 10, 50, 50, false);
+    connection.set_property(
+        ardour_toplevel,
+        x::ATOM_ATOM,
+        connection.atoms.win_type,
+        &[connection.atoms.win_type_utility],
+    );
+    f.map_as_toplevel(&mut connection, ardour_toplevel);
+
+    let yabridge_popup = connection.new_window(connection.root, 10, 10, 50, 50, false);
+    connection.set_property(
+        yabridge_popup,
+        x::ATOM_ATOM,
+        connection.atoms.win_type,
+        &[connection.atoms.win_type_normal],
+    );
+    connection.set_property(
+        yabridge_popup,
+        connection.atoms.motif_wm_hints,
+        connection.atoms.motif_wm_hints,
+        &[0x2_u32, 0, 0, 0, 0],
+    );
+    connection.set_property(
+        yabridge_popup,
+        connection.atoms.wm_hints,
+        connection.atoms.wm_hints,
+        &[0x1_u32, 0, 0, 0, 0, 0, 0, 0, 0],
+    );
+    connection.set_property(
+        yabridge_popup,
+        x::ATOM_ATOM,
+        connection.atoms.net_wm_state,
+        &[connection.atoms.skip_taskbar],
+    );
+    f.map_as_popup(&mut connection, yabridge_popup);
+
+    let steam = connection.new_window(connection.root, 10, 10, 50, 50, false);
+    connection.set_property(
+        steam,
+        x::ATOM_ATOM,
+        connection.atoms.win_type,
+        &[connection.atoms.win_type_normal],
+    );
+    connection.set_property(
+        steam,
+        connection.atoms.motif_wm_hints,
+        connection.atoms.motif_wm_hints,
+        &[0x2_u32, 0, 0, 0, 0],
+    );
+    connection.set_property(
+        steam,
+        connection.atoms.wm_hints,
+        connection.atoms.wm_hints,
+        &[0x1_u32, 1, 0, 0, 0, 0, 0, 0, 0],
+    );
+    f.map_as_toplevel(&mut connection, steam);
+
+    let battle_net = connection.new_window(connection.root, 10, 10, 50, 50, false);
+    connection.set_property(
+        battle_net,
+        x::ATOM_ATOM,
+        connection.atoms.win_type,
+        &[connection.atoms.win_type_normal],
+    );
+    connection.set_property(
+        battle_net,
+        connection.atoms.motif_wm_hints,
+        connection.atoms.motif_wm_hints,
+        &[0x3_u32, 0x2c, 0x0, 0x0, 0x0],
+    );
+    connection.set_property(
+        battle_net,
+        connection.atoms.wm_hints,
+        connection.atoms.wm_hints,
+        &[0x1_u32, 0, 0, 0, 0, 0, 0, 0, 0],
+    );
+    f.map_as_toplevel(&mut connection, battle_net);
+
+    let wallpaper_engine = connection.new_window(connection.root, 10, 10, 50, 50, false);
+    connection.set_property(
+        wallpaper_engine,
+        x::ATOM_ATOM,
+        connection.atoms.win_type,
+        &[connection.atoms.win_type_normal],
+    );
+    connection.set_property(
+        wallpaper_engine,
+        connection.atoms.motif_wm_hints,
+        connection.atoms.motif_wm_hints,
+        &[0x3_u32, 0x6, 0x0, 0x0, 0x0],
+    );
+    connection.set_property(
+        wallpaper_engine,
+        connection.atoms.wm_hints,
+        connection.atoms.wm_hints,
+        &[0x1_u32, 0, 0, 0, 0, 0, 0, 0, 0],
+    );
+    f.map_as_toplevel(&mut connection, wallpaper_engine);
 }
 
 #[test]
@@ -2071,7 +2254,7 @@ fn xsettings_fractional_scale() {
     let mut connection = Connection::new(&f.display);
     f.testwl.enable_xdg_output_manager();
 
-    let output = f.testwl.last_created_output();
+    let output = f.testwl.finalize_output();
 
     let window = connection.new_window(connection.root, 0, 0, 20, 20, false);
     let surface = f.map_as_toplevel(&mut connection, window);

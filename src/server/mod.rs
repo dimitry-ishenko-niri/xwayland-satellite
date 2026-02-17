@@ -8,21 +8,24 @@ mod tests;
 
 use self::event::*;
 use crate::xstate::{Decorations, MoveResizeDirection, WindowDims, WmHints, WmName, WmNormalHints};
-use crate::{timespec_from_millis, X11Selection, XConnection};
+use crate::{X11Selection, XConnection, timespec_from_millis};
 use clientside::MyWorld;
 use decoration::{DecorationsData, DecorationsDataSatellite};
 use hecs::Entity;
-use log::{debug, warn};
-use rustix::event::{poll, PollFd, PollFlags};
+use log::{debug, error, warn};
+use rustix::event::{PollFd, PollFlags, poll};
+use rustix::fs::Timespec;
 use smithay_client_toolkit::activation::ActivationState;
 use std::collections::{HashMap, HashSet};
 use std::ops::{Deref, DerefMut};
 use std::os::fd::{AsFd, BorrowedFd};
 use std::os::unix::net::UnixStream;
+use std::time::Duration;
 use wayland_client::protocol::wl_subcompositor::WlSubcompositor;
 use wayland_client::{
-    globals::{registry_queue_init, Global},
-    protocol as client, Connection, EventQueue, Proxy, QueueHandle,
+    Connection, EventQueue, Proxy, QueueHandle,
+    globals::{Global, registry_queue_init},
+    protocol as client,
 };
 use wayland_protocols::xdg::decoration::zv1::client::zxdg_decoration_manager_v1::ZxdgDecorationManagerV1;
 use wayland_protocols::xdg::decoration::zv1::client::zxdg_toplevel_decoration_v1::{self};
@@ -31,6 +34,7 @@ use wayland_protocols::{
     wp::{
         fractional_scale::v1::client::wp_fractional_scale_manager_v1::WpFractionalScaleManagerV1,
         linux_dmabuf::zv1::{client as c_dmabuf, server as s_dmabuf},
+        linux_drm_syncobj::v1::server::wp_linux_drm_syncobj_manager_v1::WpLinuxDrmSyncobjManagerV1,
         pointer_constraints::zv1::{
             client::{zwp_confined_pointer_v1, zwp_locked_pointer_v1},
             server::zwp_pointer_constraints_v1::ZwpPointerConstraintsV1,
@@ -60,11 +64,12 @@ use wayland_protocols::{
 };
 use wayland_server::protocol::wl_seat::WlSeat;
 use wayland_server::{
+    Client, DisplayHandle, Resource, WEnum,
+    backend::GlobalId,
     protocol::{
         wl_callback::WlCallback, wl_compositor::WlCompositor, wl_output::WlOutput, wl_shm::WlShm,
         wl_surface::WlSurface,
     },
-    Client, DisplayHandle, Resource, WEnum,
 };
 use wl_drm::{client::wl_drm::WlDrm as WlDrmClient, server::wl_drm::WlDrm as WlDrmServer};
 use xcb::x;
@@ -180,21 +185,21 @@ enum SurfaceRole {
 impl SurfaceRole {
     fn xdg(&self) -> Option<&XdgSurfaceData> {
         match self {
-            SurfaceRole::Toplevel(ref t) => t.as_ref().map(|t| &t.xdg),
-            SurfaceRole::Popup(ref p) => p.as_ref().map(|p| &p.xdg),
+            SurfaceRole::Toplevel(t) => t.as_ref().map(|t| &t.xdg),
+            SurfaceRole::Popup(p) => p.as_ref().map(|p| &p.xdg),
         }
     }
 
     fn xdg_mut(&mut self) -> Option<&mut XdgSurfaceData> {
         match self {
-            SurfaceRole::Toplevel(ref mut t) => t.as_mut().map(|t| &mut t.xdg),
-            SurfaceRole::Popup(ref mut p) => p.as_mut().map(|p| &mut p.xdg),
+            SurfaceRole::Toplevel(t) => t.as_mut().map(|t| &mut t.xdg),
+            SurfaceRole::Popup(p) => p.as_mut().map(|p| &mut p.xdg),
         }
     }
 
     fn destroy(&mut self) {
         match self {
-            SurfaceRole::Toplevel(Some(ref mut t)) => {
+            SurfaceRole::Toplevel(Some(t)) => {
                 if let Some(decoration) = t.decoration.wl.take() {
                     decoration.destroy();
                 }
@@ -338,7 +343,8 @@ enum ObjectEvent {
 }
 }
 
-fn handle_globals<'a, S: X11Selection + 'static>(
+fn handle_new_globals<'a, S: X11Selection + 'static>(
+    globals_map: &mut HashMap<GlobalName, (Global, GlobalId)>,
     dh: &DisplayHandle,
     globals: impl IntoIterator<Item = &'a Global>,
 ) {
@@ -349,7 +355,8 @@ fn handle_globals<'a, S: X11Selection + 'static>(
                     $(
                         ref x if x == <$global>::interface().name => {
                             let version = u32::min(global.version, <$global>::interface().version);
-                            dh.create_global::<InnerServerState<S>, $global, Global>(version, global.clone());
+                            let global_id = dh.create_global::<InnerServerState<S>, $global, Global>(version, global.clone());
+                            globals_map.insert(GlobalName(global.name), (global.clone(), global_id));
                         }
                     )+
                     _ => {}
@@ -367,10 +374,14 @@ fn handle_globals<'a, S: X11Selection + 'static>(
             s_dmabuf::zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1,
             ZxdgOutputManagerV1,
             ZwpPointerConstraintsV1,
-            ZwpTabletManagerV2
+            ZwpTabletManagerV2,
+            WpLinuxDrmSyncobjManagerV1
         ];
     }
 }
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
+pub(super) struct GlobalName(pub u32);
 
 struct FocusData {
     window: x::Window,
@@ -441,6 +452,7 @@ pub struct InnerServerState<S: X11Selection> {
     world: MyWorld,
     queue: EventQueue<MyWorld>,
     qh: QueueHandle<MyWorld>,
+    globals_map: HashMap<GlobalName, (Global, GlobalId)>,
     client: Client,
     to_focus: Option<FocusData>,
     unfocus: bool,
@@ -483,7 +495,9 @@ impl<S: X11Selection> ServerState<NoConnection<S>> {
             .expect("Could not bind xdg_wm_base");
 
         if xdg_wm_base.version() < 3 {
-            warn!("xdg_wm_base version 2 detected. Popup repositioning will not work, and some popups may not work correctly.");
+            warn!(
+                "xdg_wm_base version 2 detected. Popup repositioning will not work, and some popups may not work correctly."
+            );
         }
 
         let compositor = global_list
@@ -502,8 +516,13 @@ impl<S: X11Selection> ServerState<NoConnection<S>> {
             .bind::<WpViewporter, _, _>(&qh, 1..=1, ())
             .expect("Could not bind wp_viewporter");
 
-        let fractional_scale = global_list.bind::<WpFractionalScaleManagerV1, _, _>(&qh, 1..=1, ())
-            .inspect_err(|e| warn!("Couldn't bind fractional scale manager: {e}. Fractional scaling will not work."))
+        let fractional_scale = global_list
+            .bind::<WpFractionalScaleManagerV1, _, _>(&qh, 1..=1, ())
+            .inspect_err(|e| {
+                warn!(
+                    "Couldn't bind fractional scale manager: {e}. Fractional scaling will not work."
+                )
+            })
             .ok();
 
         let activation_state = ActivationState::bind(&global_list, &qh)
@@ -520,9 +539,10 @@ impl<S: X11Selection> ServerState<NoConnection<S>> {
 
         dh.create_global::<InnerServerState<S>, XwaylandShellV1, _>(1, ());
 
+        let mut globals_map = HashMap::new();
         global_list
             .contents()
-            .with_list(|globals| handle_globals::<S>(&dh, globals));
+            .with_list(|globals| handle_new_globals::<S>(&mut globals_map, &dh, globals));
 
         let world = MyWorld::new(global_list);
         let client = dh.insert_client(client, std::sync::Arc::new(())).unwrap();
@@ -533,6 +553,7 @@ impl<S: X11Selection> ServerState<NoConnection<S>> {
             client,
             queue,
             qh,
+            globals_map,
             dh,
             to_focus: None,
             unfocus: false,
@@ -601,7 +622,7 @@ impl<C: XConnection> ServerState<C> {
     }
 
     pub fn handle_clientside_events(&mut self) {
-        self.handle_new_globals();
+        self.handle_globals();
 
         for (target, event) in self.world.read_events() {
             if !self.world.contains(target) {
@@ -609,6 +630,18 @@ impl<C: XConnection> ServerState<C> {
                 continue;
             }
             event.handle(target, self);
+        }
+
+        let query = self.world.query_mut::<(&x::Window, &PendingSurfaceState)>();
+        let iter = query
+            .into_iter()
+            .map(|(e, (win, dims))| (e, (*win, *dims)))
+            .collect::<Vec<_>>();
+        for (entity, (win, dims)) in iter.into_iter() {
+            self.connection.set_window_dims(win, dims);
+            self.world
+                .remove_one::<PendingSurfaceState>(entity)
+                .unwrap();
         }
 
         if self.global_offset_updated {
@@ -635,8 +668,10 @@ impl<C: XConnection> ServerState<C> {
         }
 
         if !self.updated_outputs.is_empty() {
-            for output in self.updated_outputs.iter() {
-                let output_scale = self.world.get::<&OutputScaleFactor>(*output).unwrap();
+            for output in std::mem::take(&mut self.updated_outputs).iter() {
+                let Ok(output_scale) = self.world.get::<&OutputScaleFactor>(*output) else {
+                    continue;
+                };
                 if matches!(*output_scale, OutputScaleFactor::Output(..)) {
                     let mut surface_query = self
                         .world
@@ -660,7 +695,6 @@ impl<C: XConnection> ServerState<C> {
                     }
                 }
             }
-            self.updated_outputs.clear();
 
             let mut mixed_scale = false;
             let mut scale;
@@ -678,7 +712,9 @@ impl<C: XConnection> ServerState<C> {
             }
 
             if mixed_scale {
-                warn!("Mixed output scales detected, choosing to give apps the smallest detected scale ({scale}x)");
+                warn!(
+                    "Mixed output scales detected, choosing to give apps the smallest detected scale ({scale}x)"
+                );
             }
 
             debug!("Using new scale {scale}");
@@ -702,9 +738,39 @@ impl<C: XConnection> ServerState<C> {
 
         self.handle_selection_events();
         self.handle_activations();
-        self.queue
-            .flush()
-            .expect("Failed flushing clientside events");
+        if let Err(e) = self.queue.flush() {
+            match e {
+                wayland_client::backend::WaylandError::Io(error)
+                    if error.kind() == std::io::ErrorKind::WouldBlock =>
+                {
+                    let fd = PollFd::new(&self.queue, PollFlags::OUT);
+                    match poll(
+                        &mut [fd],
+                        Some(&Timespec {
+                            tv_sec: 0,
+                            tv_nsec: Duration::from_millis(50).as_nanos() as _,
+                        }),
+                    ) {
+                        Ok(0) => {
+                            error!(
+                                "Failed to flush clientside events (timeout)! Will try again later."
+                            );
+                        }
+                        Ok(_) => {
+                            self.queue.flush().unwrap();
+                        }
+                        Err(e) => {
+                            error!(
+                                "Failed to flush clientside events ({e})! Will try again later."
+                            );
+                        }
+                    }
+                }
+                other => {
+                    panic!("Failed flushing clientside events: {other:#?}");
+                }
+            }
+        }
     }
 
     fn close_x_window(&mut self, window: x::Window) {
@@ -724,9 +790,45 @@ impl<S: X11Selection + 'static> InnerServerState<S> {
         self.queue.as_fd()
     }
 
-    fn handle_new_globals(&mut self) {
+    fn handle_globals(&mut self) {
         let globals = std::mem::take(&mut self.world.new_globals);
-        handle_globals::<S>(&self.dh, globals.iter());
+        handle_new_globals::<S>(&mut self.globals_map, &self.dh, &globals);
+
+        let globals = std::mem::take(&mut self.world.removed_globals);
+        for global in globals {
+            let (global_struct, global_id) = self.globals_map.remove(&global).unwrap();
+            self.dh.disable_global::<InnerServerState<S>>(global_id);
+            if global_struct.interface == <WlOutput>::interface().name {
+                self.remove_output(global);
+            }
+        }
+    }
+
+    fn remove_output(&mut self, global: GlobalName) {
+        let query = self
+            .world
+            .query_mut::<(&WlOutput, &GlobalName)>()
+            .into_iter()
+            .map(|(e, (_, name))| (e, *name))
+            .collect::<Vec<_>>();
+        for (entity, name) in query.iter() {
+            if *name == global {
+                self.updated_outputs.push(*entity);
+                self.world.remove_one::<OutputScaleFactor>(*entity).unwrap();
+                let query = self
+                    .world
+                    .query_mut::<&OnOutput>()
+                    .into_iter()
+                    .map(|(e, on_out)| (e, *on_out))
+                    .collect::<Vec<_>>();
+                for (e, on_out) in query.iter() {
+                    if *on_out == OnOutput(*entity) {
+                        self.world.remove_one::<OnOutput>(*e).unwrap();
+                    }
+                }
+                break;
+            }
+        }
     }
 
     pub fn new_window(
@@ -783,7 +885,9 @@ impl<S: X11Selection + 'static> InnerServerState<S> {
         let new_title = match &mut win.attrs.title {
             Some(w) => {
                 if matches!(w, WmName::NetWmName(_)) && matches!(name, WmName::WmName(_)) {
-                    debug!("skipping setting window name to {name:?} because a _NET_WM_NAME title is already set");
+                    debug!(
+                        "skipping setting window name to {name:?} because a _NET_WM_NAME title is already set"
+                    );
                     None
                 } else {
                     debug!("setting {window:?} title to {name:?}");
@@ -1050,7 +1154,7 @@ impl<S: X11Selection + 'static> InnerServerState<S> {
             return;
         };
 
-        let SurfaceRole::Toplevel(Some(ref toplevel)) = &*role else {
+        let SurfaceRole::Toplevel(Some(toplevel)) = &*role else {
             warn!("Tried to set an unmapped toplevel or non toplevel fullscreen: {window:?}");
             return;
         };
@@ -1358,11 +1462,8 @@ impl<S: X11Selection + 'static> InnerServerState<S> {
             .world
             .get::<&client::wl_surface::WlSurface>(entity)
             .unwrap();
-        let needs_satellite_decorations = wl_decoration.is_none()
-            && window
-                .attrs
-                .decorations
-                .is_none_or(|d| d == Decorations::Server);
+        let needs_satellite_decorations =
+            wl_decoration.is_none() && window.attrs.decorations.is_none_or(|d| d.is_serverside());
         let (sat_decoration, buf) = needs_satellite_decorations
             .then(|| {
                 DecorationsDataSatellite::try_new(
@@ -1486,7 +1587,7 @@ impl<S: X11Selection + 'static> InnerServerState<S> {
     }
 }
 
-#[derive(Default, Debug)]
+#[derive(Default, Debug, Copy, Clone)]
 pub struct PendingSurfaceState {
     pub x: i32,
     pub y: i32,

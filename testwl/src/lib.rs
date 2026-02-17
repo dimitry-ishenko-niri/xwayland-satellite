@@ -6,6 +6,7 @@ use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
+use wayland_protocols::wp::linux_drm_syncobj::v1::server::wp_linux_drm_syncobj_manager_v1::WpLinuxDrmSyncobjManagerV1;
 use wayland_protocols::wp::primary_selection::zv1::server::zwp_primary_selection_device_manager_v1::ZwpPrimarySelectionDeviceManagerV1;
 use wayland_protocols::wp::primary_selection::zv1::server::zwp_primary_selection_device_v1::ZwpPrimarySelectionDeviceV1;
 use wayland_protocols::wp::primary_selection::zv1::server::zwp_primary_selection_offer_v1::ZwpPrimarySelectionOfferV1;
@@ -120,8 +121,8 @@ pub struct SurfaceData {
 impl SurfaceData {
     pub fn xdg(&self) -> &XdgSurfaceData {
         match self.role.as_ref().expect("Surface missing role") {
-            SurfaceRole::Toplevel(ref t) => &t.xdg,
-            SurfaceRole::Popup(ref p) => &p.xdg,
+            SurfaceRole::Toplevel(t) => &t.xdg,
+            SurfaceRole::Popup(p) => &p.xdg,
             SurfaceRole::Subsurface(_) => panic!("subsurface doesn't have an XdgSurface"),
             SurfaceRole::Cursor => panic!("cursor surface doesn't have an XdgSurface"),
         }
@@ -129,13 +130,13 @@ impl SurfaceData {
 
     pub fn toplevel(&self) -> &Toplevel {
         match self.role.as_ref().expect("Surface missing role") {
-            SurfaceRole::Toplevel(ref t) => t,
+            SurfaceRole::Toplevel(t) => t,
             other => panic!("Surface role was not toplevel: {other:?}"),
         }
     }
     pub fn popup(&self) -> &Popup {
         match self.role.as_ref().expect("Surface missing role") {
-            SurfaceRole::Popup(ref p) => p,
+            SurfaceRole::Popup(p) => p,
             other => panic!("Surface role was not popup: {other:?}"),
         }
     }
@@ -232,6 +233,7 @@ struct DataSourceData {
 struct Output {
     name: String,
     xdg: Option<ZxdgOutputV1>,
+    global_id: Option<GlobalId>,
 }
 
 struct KeyboardState {
@@ -265,6 +267,8 @@ struct State {
     last_surface_id: Option<SurfaceId>,
     created_surfaces: Vec<SurfaceId>,
     last_output: Option<WlOutput>,
+    last_output_global: Option<GlobalId>,
+    output_counter: u32,
     callbacks: Vec<WlCallback>,
     seat: Option<WlSeat>,
     pointer: Option<PointerState>,
@@ -295,6 +299,8 @@ impl Default for State {
             begin: Instant::now(),
             last_surface_id: None,
             last_output: None,
+            last_output_global: None,
+            output_counter: 0,
             callbacks: Vec::new(),
             seat: None,
             pointer: None,
@@ -476,6 +482,7 @@ impl Server {
         dh.create_global::<State, ZwpPointerConstraintsV1, _>(1, ());
         global_noop!(ZwpLinuxDmabufV1);
         global_noop!(ZwpRelativePointerManagerV1);
+        global_noop!(WpLinuxDrmSyncobjManagerV1);
 
         struct HandlerData;
         impl ObjectData<State> for HandlerData {
@@ -570,13 +577,15 @@ impl Server {
         &self.state.created_surfaces
     }
 
+    /// Finish the initialization of an output created by `new_output`.
+    /// This function must be called after the globals have been dispatched in order to use the
+    /// output on the server side created by `new_output` (this function's return value).
     #[track_caller]
-    pub fn last_created_output(&self) -> WlOutput {
-        self.state
-            .last_output
-            .as_ref()
-            .expect("No outputs created!")
-            .clone()
+    pub fn finalize_output(&mut self) -> WlOutput {
+        let output_s = self.state.last_output.take().expect("No new outputs");
+        let output_data = self.state.outputs.get_mut(&output_s).unwrap();
+        output_data.global_id = self.state.last_output_global.take();
+        output_s
     }
 
     pub fn get_object<T: Resource + 'static>(
@@ -843,7 +852,8 @@ impl Server {
     }
 
     pub fn new_output(&mut self, x: i32, y: i32) {
-        self.dh.create_global::<State, WlOutput, _>(4, (x, y));
+        self.state.last_output_global =
+            Some(self.dh.create_global::<State, WlOutput, _>(4, (x, y)));
         self.display.flush_clients().unwrap();
     }
 
@@ -872,6 +882,12 @@ impl Server {
     pub fn move_surface_to_output(&mut self, surface: SurfaceId, output: &WlOutput) {
         let data = self.state.surfaces.get(&surface).expect("No such surface");
         data.surface.enter(output);
+        self.display.flush_clients().unwrap();
+    }
+
+    pub fn remove_output(&mut self, output: WlOutput) {
+        let output = self.state.outputs.remove(&output).unwrap();
+        self.dh.remove_global::<State>(output.global_id.unwrap());
         self.display.flush_clients().unwrap();
     }
 
@@ -1124,13 +1140,19 @@ impl GlobalDispatch<WlOutput, (i32, i32)> for State {
             "fake monitor".to_string(),
             wl_output::Transform::Normal,
         );
-        let name = format!("WL-{}", state.outputs.len() + 1);
+        state.output_counter += 1;
+        let name = format!("WL-{}", state.output_counter);
         output.name(name.clone());
         output.mode(wl_output::Mode::Current, 1000, 1000, 0);
         output.done();
-        state
-            .outputs
-            .insert(output.clone(), Output { name, xdg: None });
+        state.outputs.insert(
+            output.clone(),
+            Output {
+                name,
+                xdg: None,
+                global_id: None,
+            },
+        );
         state.last_output = Some(output);
     }
 }
@@ -1673,7 +1695,7 @@ impl Dispatch<XdgSurface, SurfaceId> for State {
             }
             xdg_surface::Request::AckConfigure { serial } => {
                 let data = state.surfaces.get_mut(surface_id).unwrap();
-                assert_eq!(data.xdg().last_configure_serial, serial);
+                assert!(data.xdg().last_configure_serial >= serial);
             }
             xdg_surface::Request::Destroy => {
                 let data = state.surfaces.get_mut(surface_id).unwrap();

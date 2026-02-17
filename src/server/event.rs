@@ -5,7 +5,7 @@ use hecs::{CommandBuffer, World};
 use log::{debug, error, trace, warn};
 use macros::simple_event_shunt;
 use std::os::fd::AsFd;
-use wayland_client::{protocol as client, Proxy};
+use wayland_client::{Proxy, protocol as client};
 use wayland_protocols::{
     wp::{
         fractional_scale::v1::client::wp_fractional_scale_v1,
@@ -140,7 +140,7 @@ impl Event for SurfaceEvents {
                 let needs_server_side_decorations = window_data
                     .attrs
                     .decorations
-                    .is_none_or(|d| d == Decorations::Server);
+                    .is_none_or(|d| d.is_serverside());
 
                 if mode == Mode::ServerSide || !needs_server_side_decorations {
                     let mut role = entity.get::<&mut SurfaceRole>().unwrap();
@@ -273,7 +273,6 @@ impl SurfaceEvents {
         target: Entity,
         state: &mut ServerState<C>,
     ) {
-        let connection = &mut state.connection;
         let state = &mut state.inner;
         let xdg_surface::Event::Configure { serial } = event else {
             unreachable!();
@@ -330,23 +329,20 @@ impl SurfaceEvents {
                 }
             }
 
-            connection.set_window_dims(
-                window,
-                PendingSurfaceState {
-                    x,
-                    y,
-                    width: width as _,
-                    height: height as _,
-                },
-            );
             window_data.attrs.dims = WindowDims {
                 x: x as i16,
                 y: y as i16,
                 width,
                 height,
             };
-
+            let pending = PendingSurfaceState {
+                x,
+                y,
+                width: width as _,
+                height: height as _,
+            };
             drop(query);
+            state.world.insert_one(target, pending).unwrap();
             update_surface_viewport(&state.world, state.world.query_one(target).unwrap());
         }
 
@@ -476,8 +472,8 @@ pub(super) fn update_surface_viewport(
     let dims = &window_data.attrs.dims;
     let size_hints = &window_data.attrs.size_hints;
 
-    let width = (dims.width as f64 / scale_factor.0) as i32;
-    let height = (dims.height as f64 / scale_factor.0) as i32;
+    let width = (dims.width as f64 / scale_factor.0).ceil() as i32;
+    let height = (dims.height as f64 / scale_factor.0).ceil() as i32;
     if width > 0 && height > 0 {
         viewport.set_destination(width, height);
     }
@@ -987,7 +983,7 @@ impl Event for client::wl_touch::Event {
     }
 }
 
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, PartialEq, Eq)]
 pub(super) struct OnOutput(pub Entity);
 struct OutputName(String);
 fn get_output_name(output: Option<&OnOutput>, world: &World) -> Option<String> {
@@ -1518,7 +1514,6 @@ impl Event for zwp_tablet_pad_v2::Event {
                 tablet,
                 surface,
             } => {
-                let (e_tab, s_tablet) = from_client::<TabletServer, _, _>(&tablet, state);
                 let Some(surface) = surface
                     .data()
                     .copied()
@@ -1526,10 +1521,16 @@ impl Event for zwp_tablet_pad_v2::Event {
                 else {
                     return;
                 };
+                let Some(s_tablet) =
+                    tablet
+                        .data()
+                        .and_then(|key: &LateInitObjectKey<TabletClient>| {
+                            state.world.get::<&TabletServer>(key.get()).ok()
+                        })
+                else {
+                    return;
+                };
                 pad.enter(serial, &s_tablet, &surface);
-                drop(pad);
-                drop(surface);
-                state.world.spawn_at(e_tab, (tablet, s_tablet));
             }
             _ => simple_event_shunt! {
                 pad, self => [
