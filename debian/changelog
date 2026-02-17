@@ -1,3 +1,62 @@
+xwayland-satellite (0.8.1-1) unstable; urgency=medium
+
+  [ 磁铁开发部（MDD） ]
+  * fix: Round up the width under HIDPI (#374)
+
+  [ GoranKovac ]
+  * Motif popup fix (#370)
+  * Remove skip_taskbar check (#355)
+  * Detect WM_HINTS popup (yabridge popups fix) (#328)
+  * Detecting if UTILITY is popup (#323)
+  * Update WM_STATE on window map/unmap
+
+  [ En-En ]
+  * fix: panics on output removal
+  * feat: handle global removals, recalc output scale (#367)
+  * fix: correct `listenfd` assertion
+  * Add command-line options (#342)
+  * fix: test `TabletServer` initialization on `Enter`
+  * deps: bump `xcb` to 1.7.0
+  * test: add name change in fullscreen with CSD test
+  * fix(decor): respect `!self.should_draw` in `set_title`
+  * refactor: clean ECS queries to PendingSurfaceState
+  * test: while dragging, check set_window_dims calls == 1
+  * fix: dragging pop-ups causes them to stutter
+  * tests: add test for previously-unwrapping codepath
+  * fix(decor): unwrap if max width fits 0 chars
+
+  [ stefan ]
+  * flake.lock: Update
+  * nix: add overlay, remove flake-parts, and other changes
+
+  [ GoodbyeNJN ]
+  * fix: update popup detection logic to consider override_redirect flag
+  * tests: add test for combo window type in popup heuristics
+  * fix: correct popup detection logic to handle optional
+    has_skip_taskbar value
+  * feat: add support for combo window type in XState
+
+  [ Shawn Wallace ]
+  * server: support wp_linux_drm_syncobj_manager_v1
+  * cargo fmt
+  * Update to Rust 2024
+  * server: don't die if flushing events would block
+  * Add test for WM_STATE on map/unmap
+
+  [ Ivan Molodetskikh ]
+  * Advertise _NET_WM_MOVERESIZE
+
+  [ Fabio Valentini ]
+  * optionally load decoration font at runtime instead of embedding it
+
+  [ pipsuko ]
+  * Update flake.lock to nixpkgs 25.11
+
+  [ Milo ]
+  * Update nixpkgs from 25.05 to 25.11
+
+ -- Dimitry Ishenko <dimitry.ishenko@gmail.com>  Tue, 17 Feb 2026 16:29:00 -0500
+
 xwayland-satellite (0.8-1) unstable; urgency=medium
 
   * Initial release.
