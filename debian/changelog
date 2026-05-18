@@ -1,3 +1,9 @@
+xwayland-satellite (0.8.1-2) unstable; urgency=medium
+
+  * d/control: explicit dep on xwayland
+
+ -- Dimitry Ishenko <dimitry.ishenko@gmail.com>  Sun, 17 May 2026 20:11:51 -0400
+
 xwayland-satellite (0.8.1-1) unstable; urgency=medium
 
   [ 磁铁开发部（MDD） ]
