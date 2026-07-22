@@ -581,10 +581,23 @@ impl Server {
     /// This function must be called after the globals have been dispatched in order to use the
     /// output on the server side created by `new_output` (this function's return value).
     #[track_caller]
-    pub fn finalize_output(&mut self) -> WlOutput {
+    pub fn finalize_output(&mut self, x: i32, y: i32) -> WlOutput {
         let output_s = self.state.last_output.take().expect("No new outputs");
         let output_data = self.state.outputs.get_mut(&output_s).unwrap();
         output_data.global_id = self.state.last_output_global.take();
+        output_s.geometry(
+            x,
+            y,
+            0,
+            0,
+            wl_output::Subpixel::None,
+            "xwls".to_string(),
+            "fake monitor".to_string(),
+            wl_output::Transform::Normal,
+        );
+        output_s.mode(wl_output::Mode::Current, 1000, 1000, 0);
+        output_s.done();
+        self.dispatch();
         output_s
     }
 
@@ -851,9 +864,8 @@ impl Server {
         self.display.flush_clients().unwrap();
     }
 
-    pub fn new_output(&mut self, x: i32, y: i32) {
-        self.state.last_output_global =
-            Some(self.dh.create_global::<State, WlOutput, _>(4, (x, y)));
+    pub fn new_output(&mut self) {
+        self.state.last_output_global = Some(self.dh.create_global::<State, WlOutput, _>(4, ()));
         self.display.flush_clients().unwrap();
     }
 
@@ -862,6 +874,10 @@ impl Server {
             .outputs
             .iter()
             .find_map(|(output, data)| (data.name == name).then_some(output.clone()))
+    }
+
+    pub fn get_xdg_output(&mut self, output: &WlOutput) -> Option<ZxdgOutputV1> {
+        self.state.outputs[output].xdg.clone()
     }
 
     pub fn move_output(&mut self, output: &WlOutput, x: i32, y: i32) {
@@ -1091,9 +1107,6 @@ impl Dispatch<ZxdgOutputManagerV1, ()> for State {
         match request {
             zxdg_output_manager_v1::Request::GetXdgOutput { id, output } => {
                 let xdg = data_init.init(id, output.clone());
-                xdg.logical_position(0, 0);
-                xdg.logical_size(1000, 1000);
-                xdg.done();
                 state.outputs.get_mut(&output).unwrap().xdg = Some(xdg);
             }
             other => todo!("unhandled request: {other:?}"),
@@ -1120,30 +1133,19 @@ impl Dispatch<ZxdgOutputV1, WlOutput> for State {
     }
 }
 
-impl GlobalDispatch<WlOutput, (i32, i32)> for State {
+impl GlobalDispatch<WlOutput, ()> for State {
     fn bind(
         state: &mut Self,
         _: &DisplayHandle,
         _: &Client,
         resource: wayland_server::New<WlOutput>,
-        &(x, y): &(i32, i32),
+        _: &(),
         data_init: &mut wayland_server::DataInit<'_, Self>,
     ) {
         let output = data_init.init(resource, ());
-        output.geometry(
-            x,
-            y,
-            0,
-            0,
-            wl_output::Subpixel::None,
-            "xwls".to_string(),
-            "fake monitor".to_string(),
-            wl_output::Transform::Normal,
-        );
         state.output_counter += 1;
         let name = format!("WL-{}", state.output_counter);
         output.name(name.clone());
-        output.mode(wl_output::Mode::Current, 1000, 1000, 0);
         output.done();
         state.outputs.insert(
             output.clone(),
@@ -1544,20 +1546,28 @@ impl Dispatch<XdgToplevel, SurfaceId> for State {
                 let Some(SurfaceRole::Toplevel(toplevel)) = &mut data.role else {
                     unreachable!();
                 };
-                toplevel.min_size = Some(Vec2 {
-                    x: width,
-                    y: height,
-                });
+                toplevel.min_size = if width > 0 || height > 0 {
+                    Some(Vec2 {
+                        x: width,
+                        y: height,
+                    })
+                } else {
+                    None
+                };
             }
             xdg_toplevel::Request::SetMaxSize { width, height } => {
                 let data = state.surfaces.get_mut(surface_id).unwrap();
                 let Some(SurfaceRole::Toplevel(toplevel)) = &mut data.role else {
                     unreachable!();
                 };
-                toplevel.max_size = Some(Vec2 {
-                    x: width,
-                    y: height,
-                });
+                toplevel.max_size = if width > 0 || height > 0 {
+                    Some(Vec2 {
+                        x: width,
+                        y: height,
+                    })
+                } else {
+                    None
+                };
             }
             xdg_toplevel::Request::SetFullscreen { .. } => {
                 let data = state.surfaces.get_mut(surface_id).unwrap();

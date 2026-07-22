@@ -102,12 +102,11 @@ impl Drop for Fixture {
         let thread = unsafe { ManuallyDrop::take(&mut self.thread) };
         // Sending anything to the quit receiver to stop the main loop. Then we guarantee a main
         // thread does not use file descriptors which outlive the Fixture's BorrowedFd
-        let return_ptr = Box::into_raw(Box::new(0_usize)) as usize;
         // If the receiver end of the pipe closed, the main thread dropped it, which means that
         // thread already terminated
         if self
             .quit_tx
-            .write_all(&return_ptr.to_ne_bytes())
+            .write_all(&0_i32.to_ne_bytes())
             .is_err_and(|e| e.kind() != std::io::ErrorKind::BrokenPipe)
         {
             panic!("could not message the main thread to terminate");
@@ -317,9 +316,9 @@ impl Fixture {
     }
 
     fn create_output(&mut self, x: i32, y: i32) -> wayland_server::protocol::wl_output::WlOutput {
-        self.testwl.new_output(x, y);
+        self.testwl.new_output();
         self.wait_and_dispatch();
-        self.testwl.finalize_output()
+        self.testwl.finalize_output(x, y)
     }
 }
 
@@ -1441,13 +1440,19 @@ fn bad_clipboard_data() {
     assert!(data.data.is_empty(), "Unexpected data: {:?}", data.data);
 }
 
-// issue #42
+// issue #42 for title + #441 for class
 #[test]
-fn funny_window_title() {
+fn funny_window_title_class() {
     let mut f = Fixture::new();
     let mut connection = Connection::new(&f.display);
     let window = connection.new_window(connection.root, 0, 0, 20, 20, false);
     connection.set_property(window, x::ATOM_STRING, x::ATOM_WM_NAME, b"title\0\0\0\0");
+    connection.set_property(
+        window,
+        x::ATOM_STRING,
+        x::ATOM_WM_CLASS,
+        b"instance\0class\0\0\0\0",
+    );
     connection.map_window(window);
     f.wait_and_dispatch();
 
@@ -1458,6 +1463,7 @@ fn funny_window_title() {
     f.configure_and_verify_new_toplevel(&mut connection, window, surface);
     let data = f.testwl.get_surface_data(surface).unwrap();
     assert_eq!(data.toplevel().title, Some("title".into()));
+    assert_eq!(data.toplevel().app_id, Some("class".into()));
 
     connection.set_property(
         window,
@@ -1502,8 +1508,8 @@ fn close_window() {
 #[test]
 fn primary_output() {
     let mut f = Fixture::new_preset(|testwl| {
-        testwl.new_output(0, 0); // WL-1
-        testwl.new_output(500, 500); // WL-2
+        testwl.new_output(); // WL-1
+        testwl.new_output(); // WL-2
     });
     let mut conn = Connection::new(&f.display);
 
@@ -1824,6 +1830,98 @@ fn negative_output_coordinates() {
 }
 
 #[test]
+fn output_offset_xdg_matches_crtcs() {
+    let mut f = Fixture::new_preset(|testwl| {
+        testwl.enable_xdg_output_manager();
+    });
+    let connection = Connection::new(&f.display);
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct OutputInfo {
+        name: String,
+        x: i32,
+        y: i32,
+        width: i32,
+        height: i32,
+    }
+    let mut outputs = vec![
+        OutputInfo {
+            name: "WL-1".into(),
+            x: 2560,
+            y: 0,
+            width: 1920,
+            height: 1080,
+        },
+        OutputInfo {
+            name: "WL-2".into(),
+            x: 0,
+            y: 0,
+            width: 2560,
+            height: 1440,
+        },
+    ];
+
+    // WL-1 is added first, then WL-2. They are positioned so the addition of WL-2 triggers a
+    // global output offset change. Additionally, they specify wl_output and zxdg_output
+    // simultaneously, meaning when the global offset change code is ran, they will always use the
+    // Xdg output codepath. This leaves only the required wl_output::geometry event sent at global
+    // binding to be forwarded to Xwayland.
+    for info in outputs.iter() {
+        let out = f.create_output(info.x, info.y);
+        out.geometry(
+            info.x,
+            info.y,
+            16,
+            9,
+            wl_output::Subpixel::Unknown,
+            "satellite".into(),
+            info.name.clone(),
+            wl_output::Transform::Normal,
+        );
+        out.mode(wl_output::Mode::Current, info.width, info.height, 60);
+        out.name(info.name.clone());
+        out.done();
+        let out_xdg = f.testwl.get_xdg_output(&out).unwrap();
+        out_xdg.logical_position(info.x, info.y);
+        out_xdg.logical_size(info.width, info.height);
+        out_xdg.done();
+        f.testwl.dispatch();
+    }
+
+    // Give Xwayland time to respond to all of the events
+    std::thread::sleep(Duration::from_millis(50));
+    // If the required wl_output::geometry event on binding is not sent, Xwayland will leave the
+    // cathode-ray tube controller (CRTC; a representation of the area to be sent to output(s) in
+    // RandR) with an uninitialized rotation, which swaps the width and height of the CRTC.
+    let resources = connection.get_reply(&xcb::randr::GetScreenResources {
+        window: connection.root,
+    });
+    assert_eq!(resources.outputs().len(), 2);
+    for output in resources.outputs().iter().copied() {
+        let output_reply = connection.get_reply(&xcb::randr::GetOutputInfo {
+            output,
+            config_timestamp: resources.config_timestamp(),
+        });
+        let name = std::str::from_utf8(output_reply.name()).unwrap();
+        let info_idx = outputs.iter().position(|o| o.name == name).unwrap();
+        let crtc_reply = connection.get_reply(&xcb::randr::GetCrtcInfo {
+            crtc: output_reply.crtc(),
+            config_timestamp: resources.config_timestamp(),
+        });
+        let crtc_info = OutputInfo {
+            name: name.into(),
+            x: crtc_reply.x() as _,
+            y: crtc_reply.y() as _,
+            width: crtc_reply.width() as _,
+            height: crtc_reply.height() as _,
+        };
+        assert_eq!(crtc_info, outputs[info_idx]);
+        assert_eq!(crtc_reply.rotation(), xcb::randr::Rotation::ROTATE_0);
+        outputs.swap_remove(info_idx);
+    }
+}
+
+#[test]
 fn xdg_decorations() {
     let mut f = Fixture::new();
     let mut connection = Connection::new(&f.display);
@@ -1880,6 +1978,9 @@ fn forced_1x_scale_consistent_x11_size() {
     let mut f = Fixture::new();
     f.testwl.enable_xdg_output_manager();
     let output = f.create_output(0, 0);
+    let xdg_out = f.testwl.get_xdg_output(&output).unwrap();
+    xdg_out.logical_position(0, 0);
+    xdg_out.logical_size(1000, 1000);
     output.scale(2);
     output.done();
 
@@ -1949,259 +2050,9 @@ fn forced_1x_scale_consistent_x11_size() {
 }
 
 #[test]
-fn popup_heuristics() {
-    let mut f = Fixture::new();
-    let mut connection = Connection::new(&f.display);
-
-    let win_toplevel = connection.new_window(connection.root, 0, 0, 20, 20, false);
-    f.map_as_toplevel(&mut connection, win_toplevel);
-
-    let ghidra_popup = connection.new_window(connection.root, 10, 10, 50, 50, false);
-    connection.set_property(
-        ghidra_popup,
-        x::ATOM_ATOM,
-        connection.atoms.win_type,
-        &[connection.atoms.win_type_normal],
-    );
-    connection.set_property(
-        ghidra_popup,
-        x::ATOM_ATOM,
-        connection.atoms.net_wm_state,
-        &[connection.atoms.skip_taskbar],
-    );
-    connection.set_property(
-        ghidra_popup,
-        connection.atoms.motif_wm_hints,
-        connection.atoms.motif_wm_hints,
-        &[0b11_u32, 0, 0, 0, 0],
-    );
-    f.map_as_popup(&mut connection, ghidra_popup);
-
-    let reaper_dialog = connection.new_window(connection.root, 10, 10, 50, 50, false);
-    connection.set_property(
-        ghidra_popup,
-        x::ATOM_ATOM,
-        connection.atoms.win_type,
-        &[connection.atoms.win_type_normal],
-    );
-    connection.set_property(
-        ghidra_popup,
-        x::ATOM_ATOM,
-        connection.atoms.net_wm_state,
-        &[connection.atoms.skip_taskbar],
-    );
-    connection.set_property(
-        ghidra_popup,
-        connection.atoms.motif_wm_hints,
-        connection.atoms.motif_wm_hints,
-        &[0x2_u32, 0, 0x2a, 0, 0],
-    );
-    f.map_as_toplevel(&mut connection, reaper_dialog);
-
-    let chromium_menu = connection.new_window(connection.root, 10, 10, 50, 50, true);
-    connection.set_property(
-        chromium_menu,
-        x::ATOM_ATOM,
-        connection.atoms.win_type,
-        &[connection.atoms.win_type_menu],
-    );
-    f.map_as_popup(&mut connection, chromium_menu);
-
-    let chromium_tooltip = connection.new_window(connection.root, 10, 10, 50, 50, true);
-    connection.set_property(
-        chromium_tooltip,
-        x::ATOM_ATOM,
-        connection.atoms.win_type,
-        &[connection.atoms.win_type_tooltip],
-    );
-    f.map_as_popup(&mut connection, chromium_tooltip);
-
-    let discord_dnd = connection.new_window(connection.root, 20, 138, 48, 48, true);
-    connection.set_property(
-        discord_dnd,
-        x::ATOM_ATOM,
-        connection.atoms.win_type,
-        &[connection.atoms.win_type_dnd],
-    );
-    f.map_as_popup(&mut connection, discord_dnd);
-
-    let git_gui_popup = connection.new_window(connection.root, 10, 10, 50, 50, true);
-    connection.set_property(
-        git_gui_popup,
-        x::ATOM_ATOM,
-        connection.atoms.win_type,
-        &[connection.atoms.win_type_popup_menu],
-    );
-    f.map_as_popup(&mut connection, git_gui_popup);
-
-    let git_gui_dropdown = connection.new_window(connection.root, 10, 10, 50, 50, true);
-    connection.set_property(
-        git_gui_popup,
-        x::ATOM_ATOM,
-        connection.atoms.win_type,
-        &[connection.atoms.win_type_dropdown_menu],
-    );
-    f.map_as_popup(&mut connection, git_gui_dropdown);
-
-    let wechat_popup = connection.new_window(connection.root, 10, 10, 50, 50, true);
-    connection.set_property(
-        wechat_popup,
-        x::ATOM_ATOM,
-        connection.atoms.win_type,
-        &[connection.atoms.win_type_utility],
-    );
-    connection.set_property(
-        wechat_popup,
-        connection.atoms.motif_wm_hints,
-        connection.atoms.motif_wm_hints,
-        &[0x2_u32, 0, 0, 0, 0],
-    );
-    f.map_as_popup(&mut connection, wechat_popup);
-
-    let fcitx5_popup = connection.new_window(connection.root, 10, 10, 50, 50, true);
-    connection.set_property(
-        fcitx5_popup,
-        x::ATOM_ATOM,
-        connection.atoms.win_type,
-        &[connection.atoms.win_type_combo],
-    );
-    f.map_as_popup(&mut connection, fcitx5_popup);
-
-    let godot_popup = connection.new_window(connection.root, 10, 10, 50, 50, true);
-    connection.set_property(
-        godot_popup,
-        x::ATOM_ATOM,
-        connection.atoms.win_type,
-        &[connection.atoms.win_type_utility],
-    );
-    connection.set_property(
-        godot_popup,
-        connection.atoms.motif_wm_hints,
-        connection.atoms.motif_wm_hints,
-        &[0x2_u32, 0, 0, 0, 0],
-    );
-    f.map_as_popup(&mut connection, godot_popup);
-
-    let material_maker_popup = connection.new_window(connection.root, 10, 10, 50, 50, false);
-    connection.set_property(
-        material_maker_popup,
-        x::ATOM_ATOM,
-        connection.atoms.win_type,
-        &[connection.atoms.win_type_utility],
-    );
-    connection.set_property(
-        material_maker_popup,
-        connection.atoms.motif_wm_hints,
-        connection.atoms.motif_wm_hints,
-        &[0x2_u32, 0, 0, 0, 0],
-    );
-    f.map_as_popup(&mut connection, material_maker_popup);
-
-    let ardour_toplevel = connection.new_window(connection.root, 10, 10, 50, 50, false);
-    connection.set_property(
-        ardour_toplevel,
-        x::ATOM_ATOM,
-        connection.atoms.win_type,
-        &[connection.atoms.win_type_utility],
-    );
-    f.map_as_toplevel(&mut connection, ardour_toplevel);
-
-    let yabridge_popup = connection.new_window(connection.root, 10, 10, 50, 50, false);
-    connection.set_property(
-        yabridge_popup,
-        x::ATOM_ATOM,
-        connection.atoms.win_type,
-        &[connection.atoms.win_type_normal],
-    );
-    connection.set_property(
-        yabridge_popup,
-        connection.atoms.motif_wm_hints,
-        connection.atoms.motif_wm_hints,
-        &[0x2_u32, 0, 0, 0, 0],
-    );
-    connection.set_property(
-        yabridge_popup,
-        connection.atoms.wm_hints,
-        connection.atoms.wm_hints,
-        &[0x1_u32, 0, 0, 0, 0, 0, 0, 0, 0],
-    );
-    connection.set_property(
-        yabridge_popup,
-        x::ATOM_ATOM,
-        connection.atoms.net_wm_state,
-        &[connection.atoms.skip_taskbar],
-    );
-    f.map_as_popup(&mut connection, yabridge_popup);
-
-    let steam = connection.new_window(connection.root, 10, 10, 50, 50, false);
-    connection.set_property(
-        steam,
-        x::ATOM_ATOM,
-        connection.atoms.win_type,
-        &[connection.atoms.win_type_normal],
-    );
-    connection.set_property(
-        steam,
-        connection.atoms.motif_wm_hints,
-        connection.atoms.motif_wm_hints,
-        &[0x2_u32, 0, 0, 0, 0],
-    );
-    connection.set_property(
-        steam,
-        connection.atoms.wm_hints,
-        connection.atoms.wm_hints,
-        &[0x1_u32, 1, 0, 0, 0, 0, 0, 0, 0],
-    );
-    f.map_as_toplevel(&mut connection, steam);
-
-    let battle_net = connection.new_window(connection.root, 10, 10, 50, 50, false);
-    connection.set_property(
-        battle_net,
-        x::ATOM_ATOM,
-        connection.atoms.win_type,
-        &[connection.atoms.win_type_normal],
-    );
-    connection.set_property(
-        battle_net,
-        connection.atoms.motif_wm_hints,
-        connection.atoms.motif_wm_hints,
-        &[0x3_u32, 0x2c, 0x0, 0x0, 0x0],
-    );
-    connection.set_property(
-        battle_net,
-        connection.atoms.wm_hints,
-        connection.atoms.wm_hints,
-        &[0x1_u32, 0, 0, 0, 0, 0, 0, 0, 0],
-    );
-    f.map_as_toplevel(&mut connection, battle_net);
-
-    let wallpaper_engine = connection.new_window(connection.root, 10, 10, 50, 50, false);
-    connection.set_property(
-        wallpaper_engine,
-        x::ATOM_ATOM,
-        connection.atoms.win_type,
-        &[connection.atoms.win_type_normal],
-    );
-    connection.set_property(
-        wallpaper_engine,
-        connection.atoms.motif_wm_hints,
-        connection.atoms.motif_wm_hints,
-        &[0x3_u32, 0x6, 0x0, 0x0, 0x0],
-    );
-    connection.set_property(
-        wallpaper_engine,
-        connection.atoms.wm_hints,
-        connection.atoms.wm_hints,
-        &[0x1_u32, 0, 0, 0, 0, 0, 0, 0, 0],
-    );
-    f.map_as_toplevel(&mut connection, wallpaper_engine);
-}
-
-#[test]
 fn xsettings_scale() {
-    let mut f = Fixture::new_preset(|testwl| {
-        testwl.new_output(0, 0); // WL-1
-    });
+    let mut f = Fixture::new();
+    f.create_output(0, 0);
     let connection = Connection::new(&f.display);
     f.testwl.enable_xdg_output_manager();
 
@@ -2248,13 +2099,11 @@ fn xsettings_scale() {
 #[test]
 fn xsettings_fractional_scale() {
     let mut f = Fixture::new_preset(|testwl| {
-        testwl.new_output(0, 0); // WL-1
         testwl.enable_fractional_scale();
     });
     let mut connection = Connection::new(&f.display);
     f.testwl.enable_xdg_output_manager();
-
-    let output = f.testwl.finalize_output();
+    let output = f.create_output(0, 0); // WL-1
 
     let window = connection.new_window(connection.root, 0, 0, 20, 20, false);
     let surface = f.map_as_toplevel(&mut connection, window);
@@ -2385,7 +2234,7 @@ fn xsettings_switch_owner() {
 fn rotated_output() {
     let mut f = Fixture::new_preset(|testwl| {
         testwl.enable_xdg_output_manager();
-        testwl.new_output(0, 0);
+        testwl.new_output();
     });
     let mut connection = Connection::new(&f.display);
 

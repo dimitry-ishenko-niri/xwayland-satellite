@@ -7,7 +7,9 @@ pub(crate) mod selection;
 mod tests;
 
 use self::event::*;
-use crate::xstate::{Decorations, MoveResizeDirection, WindowDims, WmHints, WmName, WmNormalHints};
+use crate::xstate::{
+    Decorations, MoveResizeDirection, WindowDims, WindowRole, WmHints, WmName, WmNormalHints,
+};
 use crate::{X11Selection, XConnection, timespec_from_millis};
 use clientside::MyWorld;
 use decoration::{DecorationsData, DecorationsDataSatellite};
@@ -99,7 +101,9 @@ where
 
 #[derive(Default, Debug)]
 struct WindowAttributes {
-    is_popup: bool,
+    acquire_input_via_wm: bool,
+    has_take_focus: bool,
+    role: WindowRole,
     dims: WindowDims,
     size_hints: Option<WmNormalHints>,
     title: Option<WmName>,
@@ -107,6 +111,13 @@ struct WindowAttributes {
     group: Option<x::Window>,
     decorations: Option<Decorations>,
     transient_for: Option<x::Window>,
+}
+
+impl WindowAttributes {
+    /// AKA "Passive" input model
+    fn require_wm_focus(&self) -> bool {
+        self.acquire_input_via_wm && !self.has_take_focus
+    }
 }
 
 #[derive(Debug, Default, PartialEq, Eq, Copy, Clone)]
@@ -128,7 +139,7 @@ impl WindowData {
         Self {
             mapped: false,
             attrs: WindowAttributes {
-                is_popup: override_redirect,
+                role: WindowRole::new_basic(override_redirect),
                 dims,
                 ..Default::default()
             },
@@ -143,7 +154,7 @@ impl WindowData {
         offset: WindowOutputOffset,
         connection: &mut C,
     ) {
-        log::trace!("offset: {offset:?}");
+        log::trace!(target: "output_offset", "offset: {offset:?}");
         if offset == self.output_offset {
             return;
         }
@@ -162,7 +173,7 @@ impl WindowData {
                 height: self.attrs.dims.height as _,
             },
         ) {
-            debug!("set {:?} offset to {:?}", window, self.output_offset);
+            debug!(target: "output_offset", "set {:?} offset to {:?}", window, self.output_offset);
         }
     }
 }
@@ -386,6 +397,7 @@ pub(super) struct GlobalName(pub u32);
 struct FocusData {
     window: x::Window,
     output_name: Option<String>,
+    is_popup: bool,
 }
 
 #[derive(Copy, Clone, Default)]
@@ -644,14 +656,15 @@ impl<C: XConnection> ServerState<C> {
                 .unwrap();
         }
 
+        if self.global_output_offset.x.owner.is_none()
+            || self.global_output_offset.y.owner.is_none()
+        {
+            self.calc_global_output_offset();
+            self.global_offset_updated = true;
+        }
         if self.global_offset_updated {
-            if self.global_output_offset.x.owner.is_none()
-                || self.global_output_offset.y.owner.is_none()
-            {
-                self.calc_global_output_offset();
-            }
-
             debug!(
+                target: "output_offset",
                 "updated global output offset: {}x{}",
                 self.global_output_offset.x.value, self.global_output_offset.y.value
             );
@@ -700,36 +713,42 @@ impl<C: XConnection> ServerState<C> {
             let mut scale;
 
             let mut outputs = self.world.query_mut::<&OutputScaleFactor>().into_iter();
-            let (_, output_scale) = outputs.next().unwrap();
+            if let Some((_, output_scale)) = outputs.next() {
+                scale = output_scale.get();
 
-            scale = output_scale.get();
-
-            for (_, output_scale) in outputs {
-                if output_scale.get() != scale {
-                    mixed_scale = true;
-                    scale = scale.min(output_scale.get());
+                for (_, output_scale) in outputs {
+                    if output_scale.get() != scale {
+                        mixed_scale = true;
+                        scale = scale.min(output_scale.get());
+                    }
                 }
-            }
 
-            if mixed_scale {
-                warn!(
-                    "Mixed output scales detected, choosing to give apps the smallest detected scale ({scale}x)"
-                );
-            }
+                if mixed_scale {
+                    warn!(
+                        "Mixed output scales detected, choosing to give apps the smallest detected scale ({scale}x)"
+                    );
+                }
 
-            debug!("Using new scale {scale}");
-            self.new_scale = Some(scale);
+                debug!("Using new scale {scale}");
+                self.new_scale = Some(scale);
+            }
         }
 
         {
             if let Some(FocusData {
                 window,
                 output_name,
+                is_popup,
             }) = self.to_focus.take()
             {
-                debug!("focusing window {window:?}");
+                debug!(
+                    "focusing {} {window:?}",
+                    if is_popup { "popup" } else { "window" }
+                );
                 self.connection.focus_window(window, output_name);
-                self.last_focused_toplevel = Some(window);
+                if !is_popup {
+                    self.last_focused_toplevel = Some(window);
+                }
             } else if self.unfocus {
                 self.connection.focus_window(x::WINDOW_NONE, None);
             }
@@ -814,7 +833,9 @@ impl<S: X11Selection + 'static> InnerServerState<S> {
         for (entity, name) in query.iter() {
             if *name == global {
                 self.updated_outputs.push(*entity);
-                self.world.remove_one::<OutputScaleFactor>(*entity).unwrap();
+                self.world
+                    .remove::<(OutputScaleFactor, OutputDimensions)>(*entity)
+                    .unwrap();
                 let query = self
                     .world
                     .query_mut::<&OnOutput>()
@@ -825,6 +846,14 @@ impl<S: X11Selection + 'static> InnerServerState<S> {
                     if *on_out == OnOutput(*entity) {
                         self.world.remove_one::<OnOutput>(*e).unwrap();
                     }
+                }
+                if self.global_output_offset.x.owner == Some(*entity) {
+                    self.global_offset_updated = true;
+                    self.global_output_offset.x.owner = None;
+                }
+                if self.global_output_offset.y.owner == Some(*entity) {
+                    self.global_offset_updated = true;
+                    self.global_output_offset.y.owner = None;
                 }
                 break;
             }
@@ -856,17 +885,13 @@ impl<S: X11Selection + 'static> InnerServerState<S> {
         self.windows.insert(window, id);
     }
 
-    pub fn set_popup(&mut self, window: x::Window, is_popup: bool) {
+    pub fn set_window_role(&mut self, window: x::Window, role: WindowRole) {
         let Some(id) = self.windows.get(&window).copied() else {
             debug!("not setting popup for unknown window {window:?}");
             return;
         };
 
-        self.world
-            .get::<&mut WindowData>(id)
-            .unwrap()
-            .attrs
-            .is_popup = is_popup;
+        self.world.get::<&mut WindowData>(id).unwrap().attrs.role = role;
     }
 
     pub fn set_win_title(&mut self, window: x::Window, name: WmName) {
@@ -939,7 +964,19 @@ impl<S: X11Selection + 'static> InnerServerState<S> {
             return;
         };
 
-        self.world.get::<&mut WindowData>(id).unwrap().attrs.group = hints.window_group;
+        let attrs = &mut self.world.get::<&mut WindowData>(id).unwrap().attrs;
+        attrs.group = hints.window_group;
+        attrs.acquire_input_via_wm = hints.acquire_input_via_wm;
+    }
+
+    pub fn set_take_focus(&mut self, window: x::Window, has_take_focus: bool) {
+        let Some(id) = self.windows.get(&window).copied() else {
+            debug!("not setting hints for unknown window {window:?}");
+            return;
+        };
+
+        let attrs = &mut self.world.get::<&mut WindowData>(id).unwrap().attrs;
+        attrs.has_take_focus = has_take_focus;
     }
 
     pub fn set_size_hints(&mut self, window: x::Window, hints: WmNormalHints) {
@@ -969,12 +1006,16 @@ impl<S: X11Selection + 'static> InnerServerState<S> {
                         (min_size.width as f64 / scale_factor.0) as i32,
                         (min_size.height as f64 / scale_factor.0) as i32 + decorations_height,
                     );
+                } else {
+                    data.toplevel.set_min_size(0, 0);
                 }
                 if let Some(max_size) = &hints.max_size {
                     data.toplevel.set_max_size(
                         (max_size.width as f64 / scale_factor.0) as i32,
                         (max_size.height as f64 / scale_factor.0) as i32 + decorations_height,
                     );
+                } else {
+                    data.toplevel.set_max_size(0, 0);
                 }
             }
             win.attrs.size_hints = Some(hints);
@@ -1027,7 +1068,7 @@ impl<S: X11Selection + 'static> InnerServerState<S> {
             return true;
         };
 
-        !win.mapped || win.attrs.is_popup
+        !win.mapped || win.attrs.role.is_popup()
     }
 
     pub fn reconfigure_window(&mut self, event: x::ConfigureNotifyEvent) {
@@ -1050,7 +1091,7 @@ impl<S: X11Selection + 'static> InnerServerState<S> {
         };
         if dims == win.attrs.dims {
             return;
-        } else if win.attrs.is_popup {
+        } else if win.attrs.role.is_popup() {
             win.attrs.dims = dims;
         }
 
@@ -1136,6 +1177,12 @@ impl<S: X11Selection + 'static> InnerServerState<S> {
         if let Ok(mut role) = self.world.remove_one::<SurfaceRole>(entity.unwrap()) {
             role.destroy();
         }
+    }
+
+    /// Returns the window to restore focus to when the active window is unmapped.
+    /// If a toplevel was previously focused, returns it; otherwise returns `WINDOW_NONE`.
+    pub fn focus_restore_target(&self) -> x::Window {
+        self.last_focused_toplevel.unwrap_or(x::WINDOW_NONE)
     }
 
     pub fn set_fullscreen(&mut self, window: x::Window, state: super::xstate::SetState) {
@@ -1323,6 +1370,8 @@ impl<S: X11Selection + 'static> InnerServerState<S> {
     }
 
     fn calc_global_output_offset(&mut self) {
+        self.global_output_offset.x.value = i32::MAX;
+        self.global_output_offset.y.value = i32::MAX;
         for (entity, dimensions) in self.world.query_mut::<&OutputDimensions>() {
             if dimensions.x < self.global_output_offset.x.value {
                 self.global_output_offset.x = GlobalOutputOffsetDimension {
@@ -1339,11 +1388,13 @@ impl<S: X11Selection + 'static> InnerServerState<S> {
         }
     }
 
-    /// Returns true if the created window is a toplevel.
+    /// Creates the appropriate xdg role (toplevel or popup) for the given window.
+    /// Returns `true` if the created window is a toplevel.
     fn create_role_window(&mut self, window: x::Window, entity: Entity) -> bool {
         let xdg_surface;
         let mut popup_for = None;
         let mut fullscreen = false;
+        let splash;
 
         {
             let data = self.world.entity(entity).unwrap();
@@ -1354,9 +1405,10 @@ impl<S: X11Selection + 'static> InnerServerState<S> {
             xdg_surface = self.xdg_wm_base.get_xdg_surface(&surface, &self.qh, entity);
 
             let window_data = data.get::<&WindowData>().unwrap();
-            if window_data.attrs.is_popup {
+            if window_data.attrs.role.is_popup() {
                 popup_for = self.last_hovered.or(self.last_focused_toplevel);
             }
+            splash = window_data.attrs.role == WindowRole::Splash;
 
             let (width, height) = (window_data.attrs.dims.width, window_data.attrs.dims.height);
             for (_, dimensions) in self.world.query::<&OutputDimensions>().iter() {
@@ -1372,7 +1424,7 @@ impl<S: X11Selection + 'static> InnerServerState<S> {
             let data = self.create_popup(entity, xdg_surface, parent);
             (SurfaceRole::Popup(Some(data)), false)
         } else {
-            let data = self.create_toplevel(entity, xdg_surface, fullscreen);
+            let data = self.create_toplevel(entity, xdg_surface, fullscreen, splash);
             (SurfaceRole::Toplevel(Some(data)), true)
         };
 
@@ -1401,6 +1453,7 @@ impl<S: X11Selection + 'static> InnerServerState<S> {
         entity: Entity,
         xdg: XdgSurface,
         fullscreen: bool,
+        splash: bool,
     ) -> ToplevelData {
         let window = self.world.get::<&WindowData>(entity).unwrap();
         debug!(
@@ -1416,6 +1469,15 @@ impl<S: X11Selection + 'static> InnerServerState<S> {
             if let Some(max) = &hints.max_size {
                 toplevel.set_max_size(max.width, max.height);
             }
+        }
+        // Application splash windows are usually startup displays, so reporting their dimensions
+        // as fixed has no downside. The upside is tiling Wayland compositors use fixed size as a
+        // heurisitc to display those windows on a seperate floating level.
+        // https://yalter.github.io/niri/Floating-Windows.html
+        if splash {
+            let dims = window.attrs.dims;
+            toplevel.set_min_size(dims.width.into(), dims.height.into());
+            toplevel.set_max_size(dims.width.into(), dims.height.into());
         }
 
         let group = window.attrs.group.and_then(|win| {

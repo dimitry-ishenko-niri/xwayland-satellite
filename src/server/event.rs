@@ -212,7 +212,9 @@ impl SurfaceEvents {
 
                 let mut query = data.query::<(&x::Window, &mut WindowData)>();
                 if let Some((window, win_data)) = query.get() {
-                    let dimensions = output_data.get::<&OutputDimensions>().unwrap();
+                    let Some(dimensions) = output_data.get::<&OutputDimensions>() else {
+                        return;
+                    };
                     win_data.update_output_offset(
                         *window,
                         WindowOutputOffset {
@@ -436,16 +438,28 @@ impl SurfaceEvents {
                     "popup configure {}: {x}x{y}, {width}x{height}",
                     data.get::<&WlSurface>().unwrap().id()
                 );
-                data.get::<&mut SurfaceRole>()
-                    .unwrap()
-                    .xdg_mut()
-                    .unwrap()
-                    .pending = Some(PendingSurfaceState {
+
+                let mut role = data.get::<&mut SurfaceRole>().unwrap();
+                let xdg = role.xdg_mut().unwrap();
+                let first_configure = !xdg.configured;
+                xdg.pending = Some(PendingSurfaceState {
                     x,
                     y,
                     width,
                     height,
                 });
+
+                if first_configure {
+                    let window_data = data.get::<&WindowData>().unwrap();
+                    if window_data.attrs.require_wm_focus() {
+                        let window = *data.get::<&x::Window>().unwrap();
+                        state.inner.to_focus = Some(FocusData {
+                            window,
+                            output_name: None,
+                            is_popup: true,
+                        });
+                    }
+                }
             }
             xdg_popup::Event::Repositioned { .. } => {}
             xdg_popup::Event::PopupDone => {
@@ -689,6 +703,7 @@ impl Event for client::wl_pointer::Event {
                     decoration::handle_pointer_leave(state, parent);
                     return;
                 }
+
                 if let Some(surface) = surface
                     .data()
                     .copied()
@@ -857,6 +872,7 @@ impl Event for client::wl_keyboard::Event {
                 state.to_focus = Some(FocusData {
                     window: *window,
                     output_name,
+                    is_popup: false,
                 });
                 keyboard.enter(serial, surface, keys);
             }
@@ -1010,7 +1026,10 @@ fn update_output_scale(
     mut output_scale: hecs::QueryOne<&mut OutputScaleFactor>,
     factor: OutputScaleFactor,
 ) -> bool {
-    let output_scale = output_scale.get().unwrap();
+    let Some(output_scale) = output_scale.get() else {
+        return false;
+    };
+
     if matches!(output_scale, OutputScaleFactor::Fractional(..))
         && matches!(factor, OutputScaleFactor::Output(..))
     {
@@ -1077,7 +1096,9 @@ fn update_output_offset(
     let connection = &mut state.connection;
     let state = &mut state.inner;
     {
-        let mut dimensions = state.world.get::<&mut OutputDimensions>(output).unwrap();
+        let Ok(mut dimensions) = state.world.get::<&mut OutputDimensions>(output) else {
+            return;
+        };
         if matches!(source, OutputDimensionsSource::Wl { .. })
             && matches!(dimensions.source, OutputDimensionsSource::Xdg)
         {
@@ -1093,7 +1114,8 @@ fn update_output_offset(
                 };
                 state.global_offset_updated = true;
             } else if dim.owner == Some(output) && value > dim.value {
-                *dim = Default::default();
+                // Another output's position could be less than the new value, so recalculate
+                dim.owner = None;
                 state.global_offset_updated = true;
             }
         };
@@ -1124,7 +1146,9 @@ fn update_window_output_offsets(
     world: &World,
     connection: &mut impl XConnection,
 ) {
-    let dimensions = world.get::<&OutputDimensions>(output).unwrap();
+    let Ok(dimensions) = world.get::<&OutputDimensions>(output) else {
+        return;
+    };
     let mut query = world.query::<(&x::Window, &mut WindowData, &OnOutput)>();
 
     for (_, (window, data, _)) in query
@@ -1150,7 +1174,9 @@ pub(super) fn update_global_output_offset(
 ) {
     let entity = world.entity(output).unwrap();
     let mut query = entity.query::<(&OutputDimensions, &WlOutput)>();
-    let (dimensions, server) = query.get().unwrap();
+    let Some((dimensions, server)) = query.get() else {
+        return;
+    };
 
     let x = dimensions.x - global_output_offset.x.value;
     let y = dimensions.y - global_output_offset.y.value;
@@ -1250,12 +1276,13 @@ impl OutputEvent {
                 );
                 let global_output_offset = state.global_output_offset;
 
-                let (output, dimensions, xdg) = state
-                    .world
-                    .query_one_mut::<(&WlOutput, &mut OutputDimensions, Option<&XdgOutputServer>)>(
-                        target,
-                    )
-                    .unwrap();
+                let Ok((output, dimensions, xdg)) = state.world.query_one_mut::<(
+                    &WlOutput,
+                    &mut OutputDimensions,
+                    Option<&XdgOutputServer>,
+                )>(target) else {
+                    return;
+                };
 
                 output.geometry(
                     x - global_output_offset.x.value,
@@ -1290,10 +1317,12 @@ impl OutputEvent {
                 height,
                 refresh,
             } => {
-                let (output, dimensions) = state
+                let Ok((output, dimensions)) = state
                     .world
                     .query_one_mut::<(&WlOutput, &mut OutputDimensions)>(target)
-                    .unwrap();
+                else {
+                    return;
+                };
 
                 if flags
                     .into_result()
@@ -1348,20 +1377,24 @@ impl OutputEvent {
         match event {
             Event::LogicalPosition { x, y } => {
                 update_output_offset(target, OutputDimensionsSource::Xdg, x, y, state);
-                state
-                    .world
-                    .get::<&XdgOutputServer>(target)
-                    .unwrap()
-                    .logical_position(
-                        x - state.global_output_offset.x.value,
-                        y - state.global_output_offset.y.value,
-                    );
+                if !state.global_offset_updated {
+                    state
+                        .world
+                        .get::<&XdgOutputServer>(target)
+                        .unwrap()
+                        .logical_position(
+                            x - state.global_output_offset.x.value,
+                            y - state.global_output_offset.y.value,
+                        );
+                }
             }
             Event::LogicalSize { .. } => {
-                let (xdg, dimensions) = state
+                let Ok((xdg, dimensions)) = state
                     .world
                     .query_one_mut::<(&XdgOutputServer, &OutputDimensions)>(target)
-                    .unwrap();
+                else {
+                    return;
+                };
                 if dimensions.rotated_90 {
                     xdg.logical_size(dimensions.height, dimensions.width);
                 } else {
