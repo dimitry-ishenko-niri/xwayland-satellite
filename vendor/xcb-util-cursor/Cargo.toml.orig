@@ -1,0 +1,21 @@
+[package]
+name = "xcb-util-cursor"
+version = "0.4.0"
+authors = ["Julius Kreutz <julius@kreutz.dev>"]
+edition = "2024"
+description = "Bindings to libxcb-cursor."
+documentation = "https://docs.rs/xcb-util-cursor"
+readme = "README.md"
+homepage = "https://github.com/JuliusKreutz/xcb-util-cursor-rs"
+repository = "https://github.com/JuliusKreutz/xcb-util-cursor-rs"
+license = "MIT/Apache-2.0"
+keywords = ["xcb"]
+categories = ["api-bindings"]
+
+[lib]
+name = "xcb_util_cursor"
+path = "src/lib.rs"
+
+[dependencies]
+xcb = "1.6.0"
+xcb-util-cursor-sys = { version = "0.2.0", path = "xcb-util-cursor-sys" }
