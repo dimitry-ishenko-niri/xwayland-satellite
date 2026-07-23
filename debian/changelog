@@ -1,3 +1,43 @@
+xwayland-satellite (0.8.2-1) unstable; urgency=medium
+
+  [ Shawn Wallace ]
+  * Bump version to 0.8.2
+  * server: only focus "passive" popups
+  * Bump version to 0.8.1
+
+  [ En-En ]
+  * tests: remove `Default` when not needed
+  * feat: make SPLASH windows fixed-sized toplevels
+  * re: resolve PropertyCookie inside getters
+  * fix: make fixed size constraint to popup UTILITY
+  * fix: make undecorated transient `DIALOG` popup
+  * fix: hard-code Yabridge pop-up exception
+  * re: convert `popup_heuristics` to individual units
+  * re: clean handle_window_properties/guess_is_popup
+  * fix: revert `WM_HINTS` pop-up heuristic
+  * fix: allow WM_CLASS with multiple trailing 0 bytes
+  * fix(tests): make all of the tests green again
+  * fix: guarantee `wl_output::geometry` is sent on global bind
+  * fix: cast ExitStatus to correct type, remove Boxes (#399)
+  * fix: take ownership of `_NET_WM_CM_S0`
+  * fix: align global output offset with screen edges
+
+  [ Ivan Molodetskikh ]
+  * README: Clarify that systemd service isn't required
+
+  [ Jocelyn Turcotte ]
+  * fix: allow unsetting min/max size hints after a WM_NORMAL_HINTS
+    PropertyNotify
+
+  [ awsms ]
+  * fix: handle late scale events for removed outputs
+  * fix: avoid panic when no outputs are present
+
+  [ Jeremy Zhao ]
+  * Fix: unity editor add component pop up (#397)
+
+ -- Dimitry Ishenko <dimitry.ishenko@gmail.com>  Wed, 22 Jul 2026 21:22:26 -0400
+
 xwayland-satellite (0.8.1-2) unstable; urgency=medium
 
   * d/control: explicit dep on xwayland
